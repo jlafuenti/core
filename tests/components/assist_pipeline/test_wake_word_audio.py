@@ -7,6 +7,7 @@ from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
+from pytest_homeassistant.common import async_fire_time_changed
 
 from homeassistant.components import assist_pipeline, stt, tts
 from homeassistant.components.assist_pipeline import PipelineEvent, PipelineEventType
@@ -17,8 +18,6 @@ from homeassistant.components.assist_pipeline.arbitration import (
 from homeassistant.components.assist_pipeline.const import MS_PER_CHUNK
 from homeassistant.core import Context, HomeAssistant
 from homeassistant.util import dt as dt_util
-
-from tests.common import async_fire_time_changed
 
 from .conftest import MockSTTProviderEntity, make_10ms_chunk
 
@@ -325,4 +324,3 @@ async def test_wake_word_audio_loudest_without_audio(
     assert events[1].data["code"] == "duplicate_wake_up_detected"
     assert second_events[1].type is PipelineEventType.WAKE_WORD_END
     assert b"".join(mock_stt_provider_entity.received) == COMMAND
-

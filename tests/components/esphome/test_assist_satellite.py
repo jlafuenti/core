@@ -40,6 +40,10 @@ from homeassistant.components.assist_pipeline import (
     PipelineNotFound,
     VadSensitivity,
 )
+from homeassistant.components.assist_pipeline.arbitration import (
+    DATA_ARBITER,
+    WakeWordArbitrationMode,
+)
 from homeassistant.components.assist_pipeline.pipeline import KEY_ASSIST_PIPELINE  # pylint: disable=home-assistant-component-root-import
 from homeassistant.components.assist_satellite import (
     AssistSatelliteConfiguration,
@@ -3378,3 +3382,43 @@ async def test_wake_word_audio_waits_for_the_satellite_configuration(
         await hass.async_block_till_done()
 
     assert mock_device.voice_assistant_wake_word_audio is expected
+
+
+async def test_wake_word_audio_wanted_to_compare_satellites(
+    hass: HomeAssistant,
+    mock_client: APIClient,
+    mock_esphome_device: MockESPHomeDeviceType,
+) -> None:
+    """Test audio is requested while satellites are compared by how loud they heard."""
+    mock_client.get_voice_assistant_configuration.return_value = (
+        AssistSatelliteConfiguration(
+            available_wake_words=[
+                AssistSatelliteWakeWord(
+                    id="5678", wake_word="hey jarvis", trained_languages=["en"]
+                ),
+            ],
+            active_wake_words=["5678"],
+            max_active_wake_words=1,
+        )
+    )
+    mock_device = await mock_esphome_device(
+        mock_client=mock_client,
+        device_info={
+            "voice_assistant_feature_flags": VoiceAssistantFeature.VOICE_ASSISTANT
+            | VoiceAssistantFeature.API_AUDIO
+            | VoiceAssistantFeature.ANNOUNCE
+            | VoiceAssistantFeature.WAKE_WORD_AUDIO
+        },
+    )
+    await hass.async_block_till_done()
+    # Nothing verifies the wake word, and the first satellite to report wins
+    assert mock_device.voice_assistant_wake_word_audio is False
+
+    arbiter = hass.data[DATA_ARBITER]
+    await arbiter.async_update_settings(mode=WakeWordArbitrationMode.LOUDEST)
+    await hass.async_block_till_done()
+    assert mock_device.voice_assistant_wake_word_audio is True
+
+    await arbiter.async_update_settings(mode=WakeWordArbitrationMode.FIRST)
+    await hass.async_block_till_done()
+    assert mock_device.voice_assistant_wake_word_audio is False

@@ -265,9 +265,7 @@ class WakeWordArbiter:
                 for candidate in candidates
             ],
         }
-        _LOGGER.debug(
-            "Wake word arbitration for %s: %s", wake_word_phrase, decision
-        )
+        _LOGGER.debug("Wake word arbitration for %s: %s", wake_word_phrase, decision)
 
         for candidate in candidates:
             if candidate is winner:
