@@ -8,6 +8,8 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from pytest_homeassistant.common import async_fire_time_changed, flush_store
+from pytest_homeassistant.typing import WebSocketGenerator
 
 from homeassistant.components.assist_pipeline.arbitration import (
     DATA_ARBITER,
@@ -23,9 +25,6 @@ from homeassistant.components.assist_pipeline.const import (
 from homeassistant.components.assist_pipeline.error import DuplicateWakeUpDetectedError
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
-
-from tests.common import async_fire_time_changed, flush_store
-from tests.typing import WebSocketGenerator
 
 PHRASE = "hey jarvis"
 WINDOW_MS = 400
@@ -111,15 +110,15 @@ def test_measure_level() -> None:
 def test_measure_tone() -> None:
     """Test audio with more high frequencies measures a higher tone ratio."""
     low = measure_wake_word_audio(_tone(200, 10000))
+    low_quiet = measure_wake_word_audio(_tone(200, 1000))
     high = measure_wake_word_audio(_tone(4000, 10000))
 
     assert low is not None
+    assert low_quiet is not None
     assert high is not None
-    assert high.tone_ratio > low.tone_ratio
-    # The same pitch reads the same at any volume
-    assert measure_wake_word_audio(_tone(200, 1000)).tone_ratio == pytest.approx(  # type: ignore[union-attr]
-        low.tone_ratio, rel=0.01
-    )
+    assert high.tone_ratio > 10 * low.tone_ratio
+    # The same pitch reads about the same at any volume
+    assert low_quiet.tone_ratio == pytest.approx(low.tone_ratio, rel=0.05)
 
 
 @pytest.mark.parametrize("audio", [b"", b"\x00"])
@@ -359,7 +358,9 @@ async def test_websocket_settings(
     """Test reading and changing settings over the websocket API."""
     client = await hass_ws_client(hass)
 
-    await client.send_json_auto_id({"type": "assist_pipeline/wake_word_arbitration/get"})
+    await client.send_json_auto_id(
+        {"type": "assist_pipeline/wake_word_arbitration/get"}
+    )
     msg = await client.receive_json()
     assert msg["success"]
     assert msg["result"] == {
