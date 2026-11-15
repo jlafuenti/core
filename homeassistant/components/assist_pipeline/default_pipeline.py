@@ -31,6 +31,7 @@ from homeassistant.helpers import (
 )
 from homeassistant.util.hass_dict import HassKey
 
+from .arbitration import WakeWordAudioLevel, measure_wake_word_audio
 from .audio_enhancer import AudioEnhancer, EnhancedAudioChunk, MicroVadSpeexEnhancer
 from .const import (
     ACKNOWLEDGE_PATH,
@@ -87,6 +88,29 @@ async def _skip_audio(
             num_bytes -= skipped
         if chunk:
             yield chunk
+
+
+async def _read_audio(
+    audio_stream: AsyncIterable[bytes], num_bytes: int
+) -> tuple[bytes, AsyncGenerator[bytes]]:
+    """Return the first num_bytes of the audio, and the audio after them."""
+    stream = aiter(audio_stream)
+    head = bytearray()
+    tail = b""
+    async for chunk in stream:
+        needed = num_bytes - len(head)
+        head += chunk[:needed]
+        if len(head) == num_bytes:
+            tail = chunk[needed:]
+            break
+
+    async def rest() -> AsyncGenerator[bytes]:
+        if tail:
+            yield tail
+        async for chunk in stream:
+            yield chunk
+
+    return bytes(head), rest()
 
 
 @callback
@@ -157,9 +181,14 @@ class _PipelineController(Protocol):
     def start_debug_recording(self, name: str) -> None:
         """Start a new debug recording."""
 
-    @callback
-    def accept_wake_word(self, wake_word_phrase: str) -> None:
-        """Apply the duplicate wake-up policy."""
+    @property
+    def wants_wake_word_audio_level(self) -> bool:
+        """Return whether accepting a wake word compares its audio."""
+
+    async def async_accept_wake_word(
+        self, wake_word_phrase: str, level: WakeWordAudioLevel | None = None
+    ) -> dict[str, Any] | None:
+        """Apply the policy for satellites hearing one wake word."""
 
 
 @dataclass
@@ -334,7 +363,7 @@ class _DefaultPipelineProcessor:
         if result is None:
             wake_word_output: dict[str, Any] = {}
         else:
-            self.host.accept_wake_word(result.wake_word_phrase)
+            await self.host.async_accept_wake_word(result.wake_word_phrase)
 
             if result.queued_audio:
                 # Add audio that was pending at detection.
@@ -633,12 +662,12 @@ class _DefaultPipelineProcessor:
             PipelineEvent(PipelineEventType.STT_VAD_END, {"timestamp": timestamp_ms})
         )
 
-    @callback
-    def _accept_wake_word_audio(
+    async def _async_accept_wake_word_audio(
         self,
         wake_word_phrase: str,
         wake_word_audio_ms: int,
         verdict: voice_support.WakeWordAccepted | voice_support.WakeWordRejected | None,
+        level: WakeWordAudioLevel | None,
     ) -> bool:
         """Accept the wake word whose audio starts the stream, unless refused.
 
@@ -653,7 +682,11 @@ class _DefaultPipelineProcessor:
             accepted = False
             wake_word_output["reason"] = verdict.reason or "unverified"
         else:
-            self.host.accept_wake_word(wake_word_phrase)
+            arbitration = await self.host.async_accept_wake_word(
+                wake_word_phrase, level
+            )
+            if arbitration is not None:
+                wake_word_output["arbitration"] = arbitration
             accepted = True
 
         self.host.process_event(
@@ -1269,6 +1302,7 @@ class _DefaultPipelineProcessor:
             voice_support.WakeWordAccepted | voice_support.WakeWordRejected | None
         ) = None
         wake_word_audio_ms = request.wake_word_audio_ms
+        wake_word_level: WakeWordAudioLevel | None = None
 
         if (stt_stream is not None) and (current_stage == PipelineStage.STT):
             self._audio_run = await self._async_start_audio_run(request, stt_stream)
@@ -1284,9 +1318,15 @@ class _DefaultPipelineProcessor:
             if wake_word_audio_ms is not None:
                 # Whole chunks only, since the partial chunk at the end is dropped
                 skipped_ms = (wake_word_audio_ms // MS_PER_CHUNK) * MS_PER_CHUNK
-                stt_stream = _skip_audio(
-                    stt_stream, skipped_ms * BYTES_PER_CHUNK // MS_PER_CHUNK
-                )
+                skipped_bytes = skipped_ms * BYTES_PER_CHUNK // MS_PER_CHUNK
+                if self.host.wants_wake_word_audio_level:
+                    # The wake word audio says which satellite heard it best
+                    wake_word_audio, stt_stream = await _read_audio(
+                        stt_stream, skipped_bytes
+                    )
+                    wake_word_level = measure_wake_word_audio(wake_word_audio)
+                else:
+                    stt_stream = _skip_audio(stt_stream, skipped_bytes)
 
         if stt_stream is not None:
             # Timestamps count from the start of the stream, as when the
@@ -1323,15 +1363,16 @@ class _DefaultPipelineProcessor:
                 request.wake_word_phrase is not None
             ):
                 if wake_word_audio_ms is not None:
-                    if not self._accept_wake_word_audio(
+                    if not await self._async_accept_wake_word_audio(
                         request.wake_word_phrase,
                         wake_word_audio_ms,
                         wake_word_verdict,
+                        wake_word_level,
                     ):
                         self.cleanup()
                         return
                 else:
-                    self.host.accept_wake_word(request.wake_word_phrase)
+                    await self.host.async_accept_wake_word(request.wake_word_phrase)
 
             stt_input_stream = stt_processed_stream
 

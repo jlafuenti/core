@@ -1,15 +1,16 @@
 """The Assist pipeline integration."""
 
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Callable
 from typing import Any
 
 import probatio
 
 from homeassistant.components import stt
-from homeassistant.core import Context, HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, Context, HomeAssistant, callback
 from homeassistant.helpers import chat_session
 from homeassistant.helpers.typing import ConfigType
 
+from .arbitration import DATA_ARBITER, WakeWordArbiter
 from .const import (
     CONF_DEBUG_RECORDING_DIR,
     DATA_CONFIG,
@@ -66,9 +67,11 @@ __all__ = (
     "async_create_default_pipeline",
     "async_get_pipeline",
     "async_get_pipelines",
+    "async_on_wake_word_arbitration_changed",
     "async_pipeline_from_audio_stream",
     "async_setup_pipeline_store",
     "async_update_pipeline",
+    "async_wants_wake_word_audio",
     "indexed_select_key",
 )
 
@@ -90,11 +93,32 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
     # wake_word_id -> timestamp of last detection (monotonic_ns)
     hass.data[DATA_LAST_WAKE_UP] = {}
+    arbiter = hass.data[DATA_ARBITER] = WakeWordArbiter(
+        hass, hass.data[DATA_LAST_WAKE_UP]
+    )
+    await arbiter.async_load()
 
     await async_setup_pipeline_store(hass)
     async_register_websocket_api(hass)
 
     return True
+
+
+@callback
+def async_wants_wake_word_audio(hass: HomeAssistant) -> bool:
+    """Return whether satellites should send the audio of their wake word.
+
+    Home Assistant compares it to pick the satellite that answers.
+    """
+    return hass.data[DATA_ARBITER].wants_wake_word_audio
+
+
+@callback
+def async_on_wake_word_arbitration_changed(
+    hass: HomeAssistant, listener: Callable[[], None]
+) -> CALLBACK_TYPE:
+    """Call listener when how satellites are picked changes."""
+    return hass.data[DATA_ARBITER].async_listen(listener)
 
 
 async def async_pipeline_from_audio_stream(

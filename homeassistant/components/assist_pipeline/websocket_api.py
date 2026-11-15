@@ -17,6 +17,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import chat_session, entity_registry as er
 from homeassistant.util import language as language_util
 
+from .arbitration import DATA_ARBITER, MAX_WINDOW_MS, WakeWordArbitrationMode
 from .const import (
     DEFAULT_PIPELINE_TIMEOUT,
     DEFAULT_WAKE_WORD_TIMEOUT,
@@ -53,6 +54,8 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_list_devices)
     websocket_api.async_register_command(hass, websocket_get_run)
     websocket_api.async_register_command(hass, websocket_device_capture)
+    websocket_api.async_register_command(hass, websocket_get_wake_word_arbitration)
+    websocket_api.async_register_command(hass, websocket_set_wake_word_arbitration)
 
 
 @websocket_api.websocket_command(
@@ -529,3 +532,44 @@ async def websocket_device_capture(
         )
     finally:
         clean_up_queue()
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {probatio.Required("type"): "assist_pipeline/wake_word_arbitration/get"}
+)
+@callback
+def websocket_get_wake_word_arbitration(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Get how the satellite that answers a wake word is picked."""
+    connection.send_result(msg["id"], hass.data[DATA_ARBITER].settings.as_dict())
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        probatio.Required("type"): "assist_pipeline/wake_word_arbitration/set",
+        probatio.Optional("mode"): probatio.Coerce(WakeWordArbitrationMode),
+        probatio.Optional("window_ms"): probatio.All(
+            int, probatio.Range(min=0, max=MAX_WINDOW_MS)
+        ),
+        probatio.Optional("satellite_offsets_db"): {str: probatio.Coerce(float)},
+    }
+)
+@websocket_api.async_response
+async def websocket_set_wake_word_arbitration(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Set how the satellite that answers a wake word is picked."""
+    arbiter = hass.data[DATA_ARBITER]
+    await arbiter.async_update_settings(
+        mode=msg.get("mode"),
+        window_ms=msg.get("window_ms"),
+        satellite_offsets_db=msg.get("satellite_offsets_db"),
+    )
+    connection.send_result(msg["id"], arbiter.settings.as_dict())
