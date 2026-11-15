@@ -1,14 +1,24 @@
 """Test wake word audio from satellites in Assist pipelines."""
 
+import array
+import asyncio
 from collections.abc import AsyncGenerator, AsyncIterable
+from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
 
 from homeassistant.components import assist_pipeline, stt, tts
 from homeassistant.components.assist_pipeline import PipelineEvent, PipelineEventType
+from homeassistant.components.assist_pipeline.arbitration import (
+    DATA_ARBITER,
+    WakeWordArbitrationMode,
+)
 from homeassistant.components.assist_pipeline.const import MS_PER_CHUNK
 from homeassistant.core import Context, HomeAssistant
+from homeassistant.util import dt as dt_util
+
+from tests.common import async_fire_time_changed
 
 from .conftest import MockSTTProviderEntity, make_10ms_chunk
 
@@ -30,12 +40,14 @@ async def _async_run_pipeline(
     start_stage: assist_pipeline.PipelineStage = assist_pipeline.PipelineStage.STT,
     wake_word_phrase: str | None = "okay nabu",
     is_vad_enabled: bool = False,
+    satellite_id: str | None = None,
 ) -> list[PipelineEvent]:
     events: list[PipelineEvent] = []
     await assist_pipeline.async_pipeline_from_audio_stream(
         hass,
         context=Context(),
         event_callback=events.append,
+        satellite_id=satellite_id,
         stt_metadata=stt.SpeechMetadata(
             language="",
             format=stt.AudioFormats.WAV,
@@ -196,3 +208,121 @@ async def test_wake_word_audio_timestamps(
     assert [
         event.data for event in events if event.type is PipelineEventType.STT_VAD_END
     ] == [{"timestamp": 2 * MS_PER_CHUNK}]
+
+
+def _level_chunk(amplitude: int) -> bytes:
+    """Return 10 ms of audio at a constant level."""
+    return array.array("h", [amplitude, -amplitude] * 80).tobytes()
+
+
+@pytest.mark.usefixtures("init_components")
+async def test_wake_word_audio_loudest_satellite(
+    hass: HomeAssistant, mock_stt_provider_entity: MockSTTProviderEntity
+) -> None:
+    """Test the satellite that heard the wake word loudest gets the command."""
+    await hass.data[DATA_ARBITER].async_update_settings(
+        mode=WakeWordArbitrationMode.LOUDEST, window_ms=400
+    )
+    quiet_wake = _level_chunk(100)
+    loud_wake = _level_chunk(1000)
+
+    # The quiet satellite reports first
+    quiet = hass.async_create_task(
+        _async_run_pipeline(
+            hass,
+            _audio_stream(quiet_wake, make_10ms_chunk(b"far")),
+            MS_PER_CHUNK,
+            satellite_id="assist_satellite.quiet",
+        )
+    )
+    await asyncio.sleep(0)
+    loud = hass.async_create_task(
+        _async_run_pipeline(
+            hass,
+            # A chunk holding the end of the wake word and the start of the command
+            _audio_stream(loud_wake + COMMAND),
+            MS_PER_CHUNK,
+            satellite_id="assist_satellite.loud",
+        )
+    )
+    await asyncio.sleep(0)
+    assert not quiet.done()
+    assert not loud.done()
+
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(milliseconds=401))
+    quiet_events = await quiet
+    loud_events = await loud
+
+    assert [event.type for event in quiet_events] == [
+        PipelineEventType.RUN_START,
+        PipelineEventType.ERROR,
+        PipelineEventType.RUN_END,
+    ]
+    assert quiet_events[1].data["code"] == "duplicate_wake_up_detected"
+
+    assert [event.type for event in loud_events] == [
+        PipelineEventType.RUN_START,
+        PipelineEventType.WAKE_WORD_END,
+        PipelineEventType.STT_START,
+        PipelineEventType.STT_END,
+        PipelineEventType.RUN_END,
+    ]
+    arbitration = loud_events[1].data["wake_word_output"]["arbitration"]
+    assert arbitration["winner"] == "assist_satellite.loud"
+    assert [
+        (candidate["satellite_id"], round(candidate["level_db"]))
+        for candidate in arbitration["candidates"]
+    ] == [("assist_satellite.quiet", -50), ("assist_satellite.loud", -30)]
+    # Only the winner's command reaches speech-to-text, without its wake word
+    assert b"".join(mock_stt_provider_entity.received) == COMMAND
+
+
+@pytest.mark.usefixtures("init_components")
+async def test_wake_word_audio_loudest_without_audio(
+    hass: HomeAssistant, mock_stt_provider_entity: MockSTTProviderEntity
+) -> None:
+    """Test a satellite that sends no wake word audio waits for the others."""
+    await hass.data[DATA_ARBITER].async_update_settings(
+        mode=WakeWordArbitrationMode.LOUDEST, window_ms=400
+    )
+    events: list[PipelineEvent] = []
+
+    async def run_without_wake_word_audio() -> None:
+        await assist_pipeline.async_pipeline_from_audio_stream(
+            hass,
+            context=Context(),
+            event_callback=events.append,
+            stt_metadata=stt.SpeechMetadata(
+                language="",
+                format=stt.AudioFormats.WAV,
+                codec=stt.AudioCodecs.PCM,
+                bit_rate=stt.AudioBitRates.BITRATE_16,
+                sample_rate=stt.AudioSampleRates.SAMPLERATE_16000,
+                channel=stt.AudioChannels.CHANNEL_MONO,
+            ),
+            stt_stream=_audio_stream(COMMAND),
+            wake_word_phrase="okay nabu",
+            audio_settings=assist_pipeline.AudioSettings(is_vad_enabled=False),
+            end_stage=assist_pipeline.PipelineStage.STT,
+        )
+
+    first = hass.async_create_task(run_without_wake_word_audio())
+    await asyncio.sleep(0)
+    assert not first.done()
+    second_events_task = hass.async_create_task(
+        _async_run_pipeline(
+            hass, _audio_stream(_level_chunk(100), COMMAND), MS_PER_CHUNK
+        )
+    )
+    await asyncio.sleep(0)
+
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(milliseconds=401))
+    await first
+    second_events = await second_events_task
+
+    # The satellite whose wake word could be measured wins
+    assert events[1].type is PipelineEventType.ERROR
+    assert events[1].data["code"] == "duplicate_wake_up_detected"
+    assert second_events[1].type is PipelineEventType.WAKE_WORD_END
+    assert b"".join(mock_stt_provider_entity.received) == COMMAND
+

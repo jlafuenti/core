@@ -17,21 +17,16 @@ from homeassistant.helpers import chat_session
 from homeassistant.util import ulid as ulid_util
 from homeassistant.util.limited_size_dict import LimitedSizeDict
 
+from .arbitration import DATA_ARBITER, WakeWordAudioLevel
 from .const import (
     CONF_DEBUG_RECORDING_DIR,
     DATA_CONFIG,
-    DATA_LAST_WAKE_UP,
     SAMPLE_CHANNELS,
     SAMPLE_RATE,
     SAMPLE_WIDTH,
-    WAKE_WORD_COOLDOWN,
 )
 from .default_pipeline import _DefaultPipelineProcessor
-from .error import (
-    DuplicateWakeUpDetectedError,
-    InvalidPipelineStagesError,
-    PipelineError,
-)
+from .error import InvalidPipelineStagesError, PipelineError
 from .models import (
     PIPELINE_STAGE_ORDER,
     AudioSettings,
@@ -306,17 +301,21 @@ class PipelineRun:
         """Invalidate active processing for this run."""
         self._processor.invalidate()
 
-    @callback
-    def accept_wake_word(self, wake_word_phrase: str) -> None:
-        """Apply Home Assistant's duplicate wake-up policy."""
-        last_wake_up = self.hass.data[DATA_LAST_WAKE_UP].get(wake_word_phrase)
-        if (
-            last_wake_up is not None
-            and (time.monotonic() - last_wake_up) < WAKE_WORD_COOLDOWN
-        ):
-            _LOGGER.debug("Duplicate wake-up detected for %s", wake_word_phrase)
-            raise DuplicateWakeUpDetectedError(wake_word_phrase)
-        self.hass.data[DATA_LAST_WAKE_UP][wake_word_phrase] = time.monotonic()
+    @property
+    def wants_wake_word_audio_level(self) -> bool:
+        """Return whether accepting a wake word compares its audio."""
+        return self.hass.data[DATA_ARBITER].wants_wake_word_audio
+
+    async def async_accept_wake_word(
+        self, wake_word_phrase: str, level: WakeWordAudioLevel | None = None
+    ) -> dict[str, Any] | None:
+        """Apply Home Assistant's policy for satellites hearing one wake word.
+
+        Returns how the satellites compared, when they were compared.
+        """
+        return await self.hass.data[DATA_ARBITER].async_accept(
+            wake_word_phrase, self._satellite_id, level
+        )
 
     @callback
     def capture_audio(self, audio_bytes: bytes | None) -> None:
