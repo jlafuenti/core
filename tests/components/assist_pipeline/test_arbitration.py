@@ -121,6 +121,50 @@ def test_measure_tone() -> None:
     assert low_quiet.tone_ratio == pytest.approx(low.tone_ratio, rel=0.05)
 
 
+def test_measure_over_noise() -> None:
+    """Test the wake word is measured against the noise before it."""
+    quiet_room = measure_wake_word_audio(
+        _tone(440, 100, duration_ms=500) + _tone(440, 10000, duration_ms=1000)
+    )
+    noisy_room = measure_wake_word_audio(
+        _tone(440, 1000, duration_ms=500) + _tone(440, 10000, duration_ms=1000)
+    )
+    # The same room through a microphone with ten times the gain
+    hot_microphone = measure_wake_word_audio(
+        _tone(440, 300, duration_ms=500) + _tone(440, 30000, duration_ms=1000)
+    )
+
+    assert quiet_room is not None
+    assert noisy_room is not None
+    assert hot_microphone is not None
+    assert quiet_room.over_noise_db == pytest.approx(40, abs=0.5)
+    assert noisy_room.over_noise_db == pytest.approx(20, abs=0.5)
+    # Gain raises the level but not how far the wake word is above the noise
+    assert hot_microphone.level_db > quiet_room.level_db + 9
+    assert hot_microphone.over_noise_db == pytest.approx(
+        quiet_room.over_noise_db, abs=0.5
+    )
+
+
+def test_measure_over_noise_floor() -> None:
+    """Test silenced audio before the wake word gives a bounded margin."""
+    silenced = measure_wake_word_audio(
+        bytes(SAMPLE_RATE) + _tone(440, 32767, duration_ms=1000)
+    )
+
+    assert silenced is not None
+    # Against the lowest noise floor allowed, not against silence
+    assert silenced.over_noise_db == pytest.approx(72, abs=0.5)
+
+
+def test_measure_over_noise_short_audio() -> None:
+    """Test audio too short to hold noise and a wake word has no margin."""
+    short = measure_wake_word_audio(_tone(440, 10000, duration_ms=100))
+
+    assert short is not None
+    assert short.over_noise_db is None
+
+
 @pytest.mark.parametrize("audio", [b"", b"\x00"])
 def test_measure_no_audio(audio: bytes) -> None:
     """Test audio without a whole sample has no level."""
@@ -184,6 +228,39 @@ async def test_loudest_wins(hass: HomeAssistant, loudest: WakeWordArbiter) -> No
         candidate["tone_ratio"] == 0.1 and candidate["arrival_ms"] >= 0
         for candidate in decision["candidates"]
     )
+
+
+async def test_loudest_over_noise_wins(
+    hass: HomeAssistant, arbiter: WakeWordArbiter
+) -> None:
+    """Test the satellite furthest above its noise wins, not the loudest."""
+    await arbiter.async_update_settings(
+        mode=WakeWordArbitrationMode.LOUDEST_OVER_NOISE, window_ms=WINDOW_MS
+    )
+    assert arbiter.wants_wake_word_audio
+    hot_microphone = WakeWordAudioLevel(
+        level_db=-10.0, tone_ratio=0.1, over_noise_db=15.0
+    )
+    near = WakeWordAudioLevel(level_db=-25.0, tone_ratio=0.1, over_noise_db=30.0)
+    short = WakeWordAudioLevel(level_db=-5.0, tone_ratio=0.1)
+    hot_task, near_task, short_task = await _async_candidates(
+        hass, arbiter, ("hot", hot_microphone), ("near", near), ("short", short)
+    )
+    await _async_close_window(hass)
+
+    decision = await near_task
+    assert decision is not None
+    assert decision["mode"] == "loudest_over_noise"
+    assert decision["winner"] == "near"
+    assert [
+        (candidate["over_noise_db"], candidate["adjusted_level_db"])
+        for candidate in decision["candidates"]
+    ] == [(15.0, 15.0), (30.0, 30.0), (None, None)]
+    with pytest.raises(DuplicateWakeUpDetectedError):
+        await hot_task
+    # Audio too short to measure against noise can't be compared
+    with pytest.raises(DuplicateWakeUpDetectedError):
+        await short_task
 
 
 async def test_loudest_lone_satellite(

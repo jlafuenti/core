@@ -18,7 +18,7 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.storage import Store
 from homeassistant.util.hass_dict import HassKey
 
-from .const import DOMAIN, SAMPLE_WIDTH, WAKE_WORD_COOLDOWN
+from .const import DOMAIN, SAMPLE_RATE, SAMPLE_WIDTH, WAKE_WORD_COOLDOWN
 from .error import DuplicateWakeUpDetectedError
 
 _LOGGER = logging.getLogger(__name__)
@@ -30,6 +30,15 @@ DEFAULT_WINDOW_MS = 400
 MAX_WINDOW_MS = 2000
 
 _FULL_SCALE = 32768
+
+# Measuring the wake word against the noise around it
+_FRAME_BYTES = SAMPLE_RATE // 50 * SAMPLE_WIDTH  # 20 ms
+_MIN_FRAMES = 10
+_RECENT_FRAMES = 75  # the wake word is in the last 1.5 s
+_SPEECH_FRAMES = 10  # the loudest 200 ms
+_NOISE_QUANTILE = 0.2
+_SILENT_FRAME_DB = -120.0
+_MIN_NOISE_FLOOR_DB = -75.0
 _SAVE_DELAY = 1  # seconds
 
 
@@ -41,6 +50,9 @@ class WakeWordArbitrationMode(StrEnum):
 
     LOUDEST = "loudest"
     """The satellite that heard the wake word loudest wins."""
+
+    LOUDEST_OVER_NOISE = "loudest_over_noise"
+    """The satellite that heard it furthest above its own noise wins."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -74,6 +86,14 @@ class WakeWordAudioLevel:
     tone_ratio: float
     """Sample-to-sample change against loudness. Higher has more treble."""
 
+    over_noise_db: float | None = None
+    """Loudness of the wake word over the noise floor of the same audio.
+
+    A microphone with more gain hears the room louder too, so this
+    compares between microphones where the level doesn't. None when
+    the audio is too short to tell.
+    """
+
 
 def measure_wake_word_audio(audio: bytes) -> WakeWordAudioLevel | None:
     """Measure 16-bit mono audio of a wake word."""
@@ -97,7 +117,27 @@ def measure_wake_word_audio(audio: bytes) -> WakeWordAudioLevel | None:
             if halved_level
             else 0.0
         ),
+        over_noise_db=_measure_over_noise(audio),
     )
+
+
+def _measure_over_noise(audio: bytes) -> float | None:
+    """Measure how far the loudest part of the audio is above its noise floor."""
+    levels = []
+    for start in range(0, len(audio) - _FRAME_BYTES + 1, _FRAME_BYTES):
+        level = audioop.rms(audio[start : start + _FRAME_BYTES], SAMPLE_WIDTH)
+        levels.append(
+            20 * math.log10(level / _FULL_SCALE) if level else _SILENT_FRAME_DB
+        )
+    if len(levels) < _MIN_FRAMES:
+        return None
+
+    speech = sorted(levels[-_RECENT_FRAMES:], reverse=True)[:_SPEECH_FRAMES]
+    # Audio a noise suppressor has silenced can't claim an endless margin
+    noise_floor = max(
+        sorted(levels)[int(len(levels) * _NOISE_QUANTILE)], _MIN_NOISE_FLOOR_DB
+    )
+    return sum(speech) / len(speech) - noise_floor
 
 
 @dataclass(slots=True, kw_only=True)
@@ -205,10 +245,17 @@ class WakeWordArbiter:
             )
 
         offset = self.settings.satellite_offsets_db.get(satellite_id or "", 0.0)
+        measured: float | None = None
+        if level is not None:
+            measured = (
+                level.over_noise_db
+                if self.settings.mode is WakeWordArbitrationMode.LOUDEST_OVER_NOISE
+                else level.level_db
+            )
         candidate = _Candidate(
             satellite_id=satellite_id,
             level=level,
-            adjusted_level_db=None if level is None else level.level_db + offset,
+            adjusted_level_db=None if measured is None else measured + offset,
             arrival=now,
             accepted=self.hass.loop.create_future(),
         )
@@ -259,6 +306,9 @@ class WakeWordArbiter:
                     "satellite_id": candidate.satellite_id,
                     "level_db": candidate.level and candidate.level.level_db,
                     "tone_ratio": candidate.level and candidate.level.tone_ratio,
+                    "over_noise_db": (
+                        candidate.level and candidate.level.over_noise_db
+                    ),
                     "adjusted_level_db": candidate.adjusted_level_db,
                     "arrival_ms": round((candidate.arrival - window.opened) * 1000),
                 }
